@@ -226,7 +226,134 @@ jobs:
           name: fe_app
           path: fe_app/
 
-  patch_fe:
+patch_fe:
+    runs-on: ubuntu-latest
+    needs:
+      - download-Yui-patch
+      - download-msojocs-server
+      - scrape_fe_version
+      - download-fiddler-everywhere-windows
+      - download-fiddler-everywhere-linux
+      - download-fiddler-everywhere-mac
+    if: always()
+    env:
+      SCRAPED_VERSION: ${{ needs.scrape_fe_version.outputs.scraped_version }}
+      # We need the extension to know what to search for (dll, so, or dylib)
+      LIBRARY_EXTENSION: ${{ needs.init_os_arch.outputs.library_extension }}
+      # The patch file we downloaded
+      YUI_DOWNLOADED_NAME: ${{ needs.download-Yui-patch.outputs.Yui-fiddler-name }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with: { name: Yui-patch, path: Yui-patch }
+      - uses: actions/download-artifact@v4
+        with: { name: msojocs-patch, path: msojocs-patch }
+      - uses: actions/download-artifact@v4
+        with: { name: fe_app, path: FE }
+
+      - name: Determine JS App Root
+        run: |
+          # Mac apps have Contents/Resources/app/out
+          # Win/Linux have resources/app/out
+          if (Test-Path "FE/Contents/Resources/app/out") {
+             echo "APP_ROOT=FE/Contents/Resources/app/out" >> $env:GITHUB_ENV
+          } elseif (Test-Path "FE/resources/app/out") {
+             echo "APP_ROOT=FE/resources/app/out" >> $env:GITHUB_ENV
+          } else {
+             Throw "Could not find app/out folder structure in FE artifact"
+          }
+
+      - name: Patch Binary (Fuzzy Search)
+        run: |
+          $ext = "$env:LIBRARY_EXTENSION"
+          $patchSource = "Yui-patch/$env:YUI_DOWNLOADED_NAME"
+          
+          Write-Host "Searching for original binary matching '*fiddler.$ext'..."
+          
+          # Recursive search for any file matching *fiddler.dylib/dll/so (Case Insensitive)
+          # This handles 'Fiddler.dylib', 'libfiddler.dylib', 'fiddler.dll', etc.
+          $targetFiles = Get-ChildItem -Path "FE" -Recurse | Where-Object { $_.Name -match "fiddler\.$ext$" }
+          
+          if ($targetFiles) {
+             # Pick the first match (usually there is only one core library)
+             $targetFile = $targetFiles | Select-Object -First 1
+             Write-Host "Found target binary at: $($targetFile.FullName)"
+             
+             # Copy the Yui patch to the target location, renaming it to match the original file
+             Copy-Item -Path $patchSource -Destination $targetFile.FullName -Force
+             Write-Host "Successfully replaced $($targetFile.Name) with Yui patch."
+          } else {
+             Write-Error "Could not locate any file resembling 'fiddler.$ext' inside the FE folder."
+             exit 1
+          }
+
+      - name: Inject Server & Modify main.js
+        run: |
+          $appRoot = "$env:APP_ROOT"
+          $serverSource = "msojocs-patch/server/file"
+          $serverIndex = "msojocs-patch/server/index.js"
+          
+          # 1. Copy Server Files
+          Copy-Item -Path $serverSource -Destination "$appRoot" -Recurse -Force
+          
+          # 2. Modify Port in index.js
+          $idxContent = Get-Content $serverIndex -Raw
+          $idxContent = $idxContent -replace 'const port = \d+;', "const port = $env:PATCH_SERVER_PORT;"
+          
+          # 3. Patch main.js (Shim)
+          $mainJs = "$appRoot/main.js"
+          if (Test-Path $mainJs) {
+             $originalMain = Get-Content $mainJs -Raw
+             Copy-Item $mainJs -Destination "$appRoot/main.original.js"
+             # Combine Server Index + Original Main
+             $newContent = $idxContent + "`n" + $originalMain
+             Set-Content -Path $mainJs -Value $newContent
+             Write-Host "Successfully injected server into main.js"
+          } else {
+             Throw "main.js not found at $mainJs"
+          }
+
+      - name: Set Fake User Identity
+        run: |
+          $tokenPath = "$env:APP_ROOT/file/identity.getfiddler.com/oauth/token.json"
+          
+          # Create directory if it doesn't exist (fresh install simulation)
+          $parentDir = Split-Path -Parent $tokenPath
+          if (-not (Test-Path $parentDir)) { New-Item -ItemType Directory -Path $parentDir -Force }
+          
+          if (Test-Path $tokenPath) {
+             $json = Get-Content $tokenPath -Raw | ConvertFrom-Json
+          } else {
+             # Fallback simplified structure if file is missing
+             $json = @{ user_info = @{ identities = @( @{} ) } } 
+          }
+          
+          # Update Object
+          $json.user_info | Add-Member -Force -MemberType NoteProperty -Name "email" -Value $env:PATCH_USER_EMAIL
+          $json.user_info | Add-Member -Force -MemberType NoteProperty -Name "firstName" -Value $env:PATCH_USER_FNAME
+          $json.user_info | Add-Member -Force -MemberType NoteProperty -Name "lastName" -Value $env:PATCH_USER_LNAME
+          $json.user_info | Add-Member -Force -MemberType NoteProperty -Name "country" -Value $env:PATCH_USER_COUNTRYCODE
+          $json.user_info.identities[0] | Add-Member -Force -MemberType NoteProperty -Name "providerName" -Value $env:PATCH_USER_PROVIDER
+          
+          $json | ConvertTo-Json -Depth 10 | Set-Content $tokenPath
+
+      - name: Cleanup & Rename
+        id: finalize
+        run: |
+          Remove-Item -Path "Yui-patch", "msojocs-patch" -Recurse -ErrorAction SilentlyContinue
+          
+          # Try to restore permissions (best effort for Linux/Mac)
+          if ($IsLinux) {
+             chmod -R +x FE
+          }
+          
+          $finalName = "Fiddler-Everywhere-V$env:SCRAPED_VERSION-Patched"
+          Rename-Item -Path "FE" -NewName $finalName
+          echo "artifact_name=$finalName" >> $env:GITHUB_OUTPUT
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.finalize.outputs.artifact_name }}
+          path: ${{ steps.finalize.outputs.artifact_name }}/
     runs-on: ubuntu-latest
     needs:
       - download-Yui-patch
